@@ -1,3 +1,4 @@
 [submodule "third_party/SIMPLE"]
 	path = third_party/SIMPLE
 	url = git@github.com:physical-superintelligence-lab/SIMPLE.git
+	branch = main
