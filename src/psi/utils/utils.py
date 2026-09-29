@@ -216,6 +216,7 @@ def resolve_path(path: Union[str, Path], subdir="data", auto_download=False) -> 
                 local_dir=os.getcwd(),
                 repo_type="dataset",
                 # resume_download=True,
+                # token="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",
             )
             # print(data_dir);exit(0)
             # zip_path = os.path.join(data_dir, zip_file)

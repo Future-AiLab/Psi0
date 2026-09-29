@@ -1,25 +1,4 @@
 #!/bin/bash
-# psi0 (real sonic) finetune with the VLM unfrozen and a DEEPER, layerwise-conditioned
-# action header -- the "2.8B" variant of finetune-real-sonic-psi0.sh (2.13B Qwen VLM
-# backbone plus the 12-block action header).
-#
-# Data, task CLI, action/state dims, resolution, checkpoints and the step schedule are
-# UNCHANGED from finetune-real-sonic-psi0.sh. The model knobs below are ported from
-# finetune-sonic-neck-zedmini-as-a-baseline-270x480-10x-vlm-lr-combined-dit-layerwise-
-# 12blocks.sh, INCLUDING its --model.no-rtc (the base script enables RTC; this one does
-# not). Deliberately NOT ported: its 270x480 canvas (this script stays at 240x320) and
-# its 100k-step schedule.
-#
-# TRAINER: --train.name=finetune is REQUIRED here, not a preference. FinetuneTrainer is
-#   the only trainer that implements the two features this script depends on:
-#     - the frozen CLIP pooled text encoder that feeds combined_temb
-#       (compute_pooled_projections, finetune.py:220)
-#     - per-component VLM optimizer groups
-#       (vlm_trainable_components:416, _vlm_group_of, create_optimizers:443)
-#   SonicTrainer has NEITHER -- `grep pooled_text_encoder src/psi/trainers/sonic.py`
-#   returns nothing, and its optimizer never reads vision_tower_lr / mm_projector_lr.
-#   Run this with --train.name=sonic and combined_temb crashes for want of a
-#   pooled_projections vector, while two of the three VLM LRs are silently ignored.
 #
 # Ported knobs
 #   --model.tune-vlm             unfreeze the VLM (was --model.no-tune-vlm). With no
@@ -62,6 +41,13 @@
 
 export OMP_NUM_THREADS=32
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+# When run directly on the host (not via sbatch), resolve to project root.
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+fi
+
+export exp="${1:-ff}"
+TS="${2:-}"   # %y%m%d%H%M run-dir suffix; empty -> fresh run, config mints one
 
 source "${PSI_VENV:-$([ -d /workspace/.venv-psi ] && echo /workspace/.venv-psi || echo .venv-psi)}/bin/activate"
 DATA_ROOT=${DATA_ROOT:-.data/teleop5_round2_wm_train_val_full_cleaned}
@@ -72,6 +58,11 @@ VAL_IDS=${VAL_IDS:-teleop5_lerobot_psix_val/g1}
 # here, unlike the g1_sonic/psix_sonic packs. Path is resolved relative to the project
 # root by resolve_path().
 STATS=${STATS:-$DATA_ROOT/$TRAIN_IDS/meta/stats.json}
+# Sample label (repack dataset-name): DATASET_NAME, else the first 10 chars of the training
+# dir's basename, skipping the trailing g1/ robot subdir (e.g. psix_steerability_0918_train -> psix_steer).
+_train_dir="${PACK%/}"
+[ "$(basename "$_train_dir")" = "g1" ] && _train_dir="$(dirname "$_train_dir")"
+DATASET_NAME="${DATASET_NAME:-$(basename "$_train_dir" | cut -c1-10)}"
 
 NPROC_PER_NODE=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 ulimit -n 65535
@@ -95,7 +86,7 @@ echo "Experiment name: $exp"
 # Split the post-trained checkpoint into the VLM dir + action_header.safetensors that
 # the two --model flags below want. ~11 GB, written once and reused; the exporter
 # stages into <dir>.partial and renames, so a waiting node never sees a half file.
-POSTTRAIN_RUN="${POSTTRAIN_RUN:-.runs/posttrain/dropout.us.flow1000.cosine.lr1.0e-04.b256.gpus8.2609012205}"
+POSTTRAIN_RUN="${POSTTRAIN_RUN:-.cache/checkpoint/postpre.sonic1.0.unifolm.2609092156.40k}"
 CKPT_STEP="${CKPT_STEP:-40000}"
 CKPT_DIR="$POSTTRAIN_RUN/checkpoints/ckpt_$CKPT_STEP"
 INIT_DIR="$POSTTRAIN_RUN/posttrained/ckpt_$CKPT_STEP"
@@ -120,10 +111,24 @@ for f in config.json model.safetensors action_header.safetensors; do
 done
 echo "Warm start from $INIT_DIR (VLM + action header, ckpt_$CKPT_STEP)"
 
+# --- robustness knobs --------------------------------------------------------
+STATE_DROP_PROB="${STATE_DROP_PROB:-0.1}"     # per-sample state drop -> learned null token; 0 disables
+STATE_JITTER="${STATE_JITTER:-10}"            # frames; 0 disables the temporal state aug
+STATE_JITTER_PROB="${STATE_JITTER_PROB:-0.5}"
+STATE_NOISE_STD="${STATE_NOISE_STD:-0.05}"    # in normalized [-1,1] units; 0 disables
+VIEW_AUG_MIN_SCALE="${VIEW_AUG_MIN_SCALE:-0.85}"
+VIEW_AUG_PROB="${VIEW_AUG_PROB:-1.0}"
+# "<task substring>=<weight> ..." (space separated); empty -> uniform sampling.
+TASK_SAMPLE_WEIGHTS="${TASK_SAMPLE_WEIGHTS-}"
+task_weight_args=""
+[ -n "$TASK_SAMPLE_WEIGHTS" ] && task_weight_args="--data.task-sample-weights $TASK_SAMPLE_WEIGHTS"
+echo "State aug: drop=${STATE_DROP_PROB} (learned null token) jitter=+-${STATE_JITTER}f p=${STATE_JITTER_PROB} noise=${STATE_NOISE_STD}; view aug: min_scale=${VIEW_AUG_MIN_SCALE} p=${VIEW_AUG_PROB}; task weights: ${TASK_SAMPLE_WEIGHTS:-none}"
+
 args="
 finetune_sonic_psi0_config \
 --seed=292285 \
 --exp=$exp \
+${TS:+--timestamp=$TS --train.resume_from_checkpoint=latest} \
 --train.name=finetune \
 --train.data_parallel=ddp \
 --train.mixed_precision=bf16 \
@@ -135,7 +140,7 @@ finetune_sonic_psi0_config \
 --train.warmup_ratio=None \
 --train.warmup_steps=1000 \
 --train.checkpointing_steps=5000 \
---train.validation_steps=1000 \
+--train.validation_steps=5000 \
 --train.val_num_batches=100 \
 --train.max_grad_norm=1.0 \
 --train.lr_scheduler_type=cosine \
@@ -145,12 +150,16 @@ finetune_sonic_psi0_config \
 --data.root_dir=$DATA_ROOT \
 --data.train_repo_ids $TRAIN_IDS \
 --data.val_repo_ids $VAL_IDS \
+--data.transform.repack.image-keys observation.images.egocentric \
 --data.transform.repack.action-keys action.body_token_v1_1 action[:14] action.neck \
---data.transform.repack.dataset-name=teleop5round2full \
+--data.transform.repack.dataset-name=$DATASET_NAME \
 --data.transform.repack.pad-action-dim=80 \
 --data.transform.repack.pad-state-dim=45 \
 --data.transform.repack.instruction-key=task_description \
+--data.transform.repack.state-temporal-jitter=$STATE_JITTER \
+--data.transform.repack.state-temporal-jitter-prob=$STATE_JITTER_PROB \
 --data.transform.field.stat-path=$STATS \
+--data.transform.field.state-noise-std=$STATE_NOISE_STD \
 --data.transform.field.stat-action-keys action.body_token_v1_1 action[:14] action.neck \
 --data.transform.field.stat-state-keys observation.state \
 --data.transform.field.action_norm_type=bounds \
@@ -159,8 +168,12 @@ finetune_sonic_psi0_config \
 --data.transform.field.pad-action-dim=80 \
 --data.transform.field.pad-state-dim=45 \
 --data.transform.model.img-aug \
+--data.transform.model.view-aug \
+--data.transform.model.view-aug-min-scale=$VIEW_AUG_MIN_SCALE \
+--data.transform.model.view-aug-prob=$VIEW_AUG_PROB \
 --data.transform.model.resize.size 270 480 \
 --data.transform.model.center_crop.size 270 480 \
+$task_weight_args \
 --model.model_name_or_path=$INIT_DIR \
 --model.pretrained-action-header-path=$INIT_DIR \
 --model.noise-scheduler=flow \
@@ -184,7 +197,9 @@ finetune_sonic_psi0_config \
 --model.combined-temb \
 --model.num-blocks=12 \
 --model.vlm-layer-indices 3 5 8 10 12 14 17 19 21 23 26 28 \
---model.state-drop-prob=0.1 \
+--model.state-drop-prob=$STATE_DROP_PROB \
+--model.state-as-action-token \
+--model.state-null-token \
 --model.pooled-text-encoder=clip \
 --model.pooled-text-encoder-path=openai/clip-vit-large-patch14 \
 --model.pooled-projection-dim=768 \

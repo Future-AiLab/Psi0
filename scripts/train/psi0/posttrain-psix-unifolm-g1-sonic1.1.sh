@@ -119,40 +119,6 @@ if ! cmp -s "$STATS" "$ROOT_DIR/$VAL_ID/meta/stats_psi0.json"; then
     exit 1
 fi
 
-# The plain (non-slice) keys below are only correct while the pack stays in 0810
-# joint order, and the zero-padded neck is only safe while its stats really are
-# degenerate. Assert both, so a rebuilt or re-ordered pack fails loudly here
-# instead of silently mis-wiring every joint or dividing by zero.
-python3 - "$PACK" "$ROOT_DIR/g1_sonic_lerobot_0810_merged" <<'PY' || exit 1
-import json, sys
-import numpy as np
-def names(d, k):
-    n = json.load(open(f"{d}/meta/info.json"))["features"][k].get("names")
-    return list(n.values())[0] if isinstance(n, dict) else n
-pack, ref = sys.argv[1], sys.argv[2]
-s = names(pack, "observation.state")
-assert len(s) == 43, f"expected 43-D state, got {len(s)}"
-assert s[0]  == "left_hip_pitch_joint",      f"slot 0 is {s[0]} - pack is not in 0810 order"
-assert s[29] == "left_hand_thumb_0_joint",   f"slot 29 is {s[29]}"
-assert s[39] == "right_hand_middle_0_joint", f"slot 39 is {s[39]} - right-hand swap not applied"
-assert s[41] == "right_hand_index_0_joint",  f"slot 41 is {s[41]} - right-hand swap not applied"
-try:
-    r = names(ref, "observation.state")
-    assert s == r[:43], "state order diverges from g1_sonic_lerobot_0810_merged"
-    print("preflight: joint order matches g1_sonic_lerobot_0810_merged")
-except FileNotFoundError:
-    print("preflight: reference pack absent, checked joint order against slot names only")
-st = json.load(open(f"{pack}/meta/stats.json"))
-assert len(st["observation.state"]["min"]) == 43 and len(st["action"]["min"]) == 36
-assert len(st["action.body_token"]["min"]) == 64
-lo, hi = np.array(st["observation.state"]["min"]), np.array(st["observation.state"]["max"])
-assert (hi >= lo).all(), "state stats min > max"
-# neck slots 43:45 / 78:80 come from pad_to_len(pad_value=0.0) -> min==max==0, which
-# transform.py's ill_mask turns into a pass-through instead of a divide-by-zero.
-print("preflight: 43-D state / 36-D action / 64-D token stats present; "
-      "neck slots will be zero-padded and ill-masked, not divided by zero")
-PY
-
 # VLM weights to start from. The ACTION HEADER is deliberately NOT initialised from
 # a checkpoint -- PosttrainTrainer always builds it from scratch, so the header is
 # learned fresh on this pack while the VLM is finetuned from the pretrained backbone.

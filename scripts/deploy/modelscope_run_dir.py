@@ -17,7 +17,9 @@ an ssh one.
     upload_ckpt_ms [ms-repo-id] [path-prefix] [run-dir] [ckpt-step] [local-base]
 
 Set DRY_RUN=1 to print what would be uploaded without transferring anything,
-and MAX_RETRIES to change the retry budget (default 50, as in the rsync script).
+MAX_RETRIES to change the retry budget (default 50, as in the rsync script), and
+EXTRA_IGNORE=posttrained (comma-separated globs) to leave extra run-level folders
+out of the metadata upload.
 
 The API token is read from the environment (MODELSCOPE_API_TOKEN, falling back
 to MS_UPLOAD_TOKEN), loaded from the project .env if present. It is never
@@ -132,6 +134,14 @@ def main():
             f"Check that {TOKEN_ENV_VAR} is valid and has write access to the repo."
         )
 
+    # EXTRA_IGNORE: comma-separated glob patterns dropped from the metadata job,
+    # e.g. EXTRA_IGNORE=posttrained to leave the exported posttrained/ folder out.
+    extra_ignore = []
+    for pat in os.environ.get("EXTRA_IGNORE", "").split(","):
+        pat = pat.strip().strip("/")
+        if pat:
+            extra_ignore += [pat, f"{pat}/**"]
+
     # Two uploads instead of a staging copy: checkpoints are tens of GB and
     # copying them just to filter would double the disk cost.
     #   1. run metadata (configs, logs) minus wandb/ and checkpoints/
@@ -140,7 +150,7 @@ def main():
         (
             source,
             remote_dir,
-            ["wandb", "wandb/**", "checkpoints", "checkpoints/**"],
+            ["wandb", "wandb/**", "checkpoints", "checkpoints/**"] + extra_ignore,
             "run metadata",
         ),
         (
